@@ -8,6 +8,53 @@ const os = require('node:os');
 
 const auto = require('./cursor-automation.cjs');
 
+test('prepareCursorCliConfig creates a secure config when Cursor leaves it absent', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-cli-config-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const configPath = path.join(tempDir, '.cursor', 'cli-config.json');
+
+  const config = auto.prepareCursorCliConfig({ configPath });
+
+  assert.deepEqual(config.sandbox, {
+    mode: 'enabled',
+    networkAccess: 'user_config',
+  });
+  assert.equal(config.version, 1);
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(configPath, 'utf8')),
+    config,
+  );
+  assert.equal(fs.statSync(configPath).mode & 0o777, 0o600);
+});
+
+test('prepareCursorCliConfig preserves preferences and adds web denials once', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-cli-config-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const configPath = path.join(tempDir, 'cli-config.json');
+  fs.writeFileSync(configPath, JSON.stringify({
+    version: 7,
+    editor: { vimMode: true },
+    permissions: {
+      allow: ['Read(**)'],
+      deny: ['WebSearch(*)'],
+    },
+    sandbox: { mode: 'disabled', networkAccess: 'enabled', git: true },
+  }));
+
+  auto.prepareCursorCliConfig({ configPath, denyWeb: true });
+  const config = auto.prepareCursorCliConfig({ configPath, denyWeb: true });
+
+  assert.equal(config.version, 7);
+  assert.deepEqual(config.editor, { vimMode: true });
+  assert.deepEqual(config.permissions.allow, ['Read(**)']);
+  assert.deepEqual(config.permissions.deny, ['WebSearch(*)', 'WebFetch(*)']);
+  assert.deepEqual(config.sandbox, {
+    mode: 'enabled',
+    networkAccess: 'user_config',
+    git: true,
+  });
+});
+
 test('isValidIssueFormat accepts modern bug template', () => {
   assert.equal(
     auto.isValidIssueFormat({
@@ -1690,29 +1737,119 @@ test('every Cursor job prepares and verifies the Linux sandbox host', () => {
   }
 });
 
-test('workflow exposes a credential-free Cursor sandbox smoke check', () => {
+test('workflow keeps sandbox probes credential-free and runs an authenticated agent smoke', () => {
   const workflow = fs.readFileSync(
     path.join(__dirname, '..', '.github', 'workflows', 'cursor-automation.yml'),
     'utf8',
   );
   assert.match(
     workflow,
-    /sandbox_smoke:\n\s+description: Verify the Cursor sandbox without repository credentials\n\s+required: false\n\s+type: boolean\n\s+default: false/,
+    /sandbox_smoke:\n\s+description: Verify the Cursor sandbox and authenticated agent\n\s+required: false\n\s+type: boolean\n\s+default: false/,
   );
   const smokeJob = workflow.match(
     /\n  sandbox_smoke:\n[\s\S]*?(?=\n  [a-zA-Z0-9_]+:\n)/,
   )?.[0] || '';
-  assert.match(smokeJob, /permissions: \{\}/);
+  assert.match(smokeJob, /permissions:\n\s+contents: read/);
+  assert.match(
+    smokeJob,
+    /Checkout trusted helper[\s\S]*?persist-credentials: false/,
+  );
+  assert.match(
+    smokeJob,
+    /ref: \$\{\{ github\.event_name == 'schedule' && github\.event\.repository\.default_branch \|\| github\.sha \}\}/,
+  );
   assert.match(smokeJob, /run: \*prepare_cursor_sandbox_host/);
   assert.match(smokeJob, /agent sandbox enable/);
+  assert.match(
+    smokeJob,
+    /prepareCursorCliConfig[\s\S]*?agent sandbox run -- touch \.cursor-runtime\/sandbox-smoke/,
+  );
+  assert.match(
+    smokeJob,
+    /agent sandbox run -- curl -fsS --max-time 3 -o \/dev\/null https:\/\/example\.com/,
+  );
   assert.match(smokeJob, /--policy "\$sandbox_policy_file"/);
   assert.match(smokeJob, /sandbox: \{/);
   assert.match(smokeJob, /networkAccess: false/);
   assert.match(smokeJob, /touch \.cursor-runtime\/sandbox-smoke/);
   assert.match(smokeJob, /Cursor sandbox unexpectedly allowed network access/);
-  assert.doesNotMatch(smokeJob, /agent sandbox run/);
   assert.doesNotMatch(smokeJob, /--sandbox-policy/);
-  assert.doesNotMatch(smokeJob, /CURSOR_API_KEY|GITHUB_TOKEN|GH_TOKEN/);
+  const sandboxStep = smokeJob.match(
+    /- name: Verify Cursor sandbox[\s\S]*?(?=\n\s{6}- name:)/,
+  )?.[0] || '';
+  assert.doesNotMatch(sandboxStep, /CURSOR_API_KEY|GITHUB_TOKEN|GH_TOKEN/);
+  assert.match(
+    smokeJob,
+    /- name: Stage Cursor API key for authenticated smoke[\s\S]*?CURSOR_API_KEY: \$\{\{ secrets\.CURSOR_API_KEY \}\}/,
+  );
+  const authenticatedSmokeStep = smokeJob.match(
+    /- name: Run authenticated Cursor agent smoke[\s\S]*?(?=\n\s{6}- name:)/,
+  )?.[0] || '';
+  assert.doesNotMatch(authenticatedSmokeStep, /CURSOR_API_KEY|CURSOR_AUTH_TOKEN/);
+  assert.match(
+    authenticatedSmokeStep,
+    /"\$RUNNER_TEMP\/cursor-agent-authenticated" \\\n\s+-p --trust/,
+  );
+  assert.doesNotMatch(smokeJob, /--api-key/);
+  assert.match(smokeJob, /allow: \["Shell\(node\)"\]/);
+  assert.match(smokeJob, /CURSOR_AUTH_PROBE_OK/);
+  assert.match(smokeJob, /readdirSync\('\/proc'\)/);
+  assert.match(smokeJob, /cursor-auth-config\.\*\/cursor\/auth\.json/);
+  assert.match(smokeJob, /Scan authenticated Cursor smoke output for credential leaks/);
+});
+
+test('workflow prepares missing Cursor config on every agent path and checks it daily', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', '.github', 'workflows', 'cursor-automation.yml'),
+    'utf8',
+  );
+  const prepareCalls = workflow.match(/prepareCursorCliConfig/g) || [];
+
+  assert.equal(prepareCalls.length, 7);
+  assert.doesNotMatch(
+    workflow,
+    /JSON\.parse\(fs\.readFileSync\(p, "utf8"\)\)/,
+  );
+  assert.match(workflow, /- cron: '17 3 \* \* \*'/);
+  assert.match(
+    workflow,
+    /context\.payload\.schedule === '17 3 \* \* \*'[\s\S]*?return set\('skip'/,
+  );
+  const smokeJob = workflow.match(
+    /\n  sandbox_smoke:\n[\s\S]*?(?=\n  [a-zA-Z0-9_]+:\n)/,
+  )?.[0] || '';
+  assert.match(smokeJob, /github\.event\.schedule == '17 3 \* \* \*'/);
+  assert.match(smokeJob, /prepareCursorCliConfig/);
+});
+
+test('workflow passes direct commands after the Cursor option boundary', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', '.github', 'workflows', 'cursor-automation.yml'),
+    'utf8',
+  );
+  const sandboxRunLines = workflow
+    .split('\n')
+    .filter((line) => line.includes('agent sandbox run'))
+    .map((line) => line.trim());
+  const expectedTouchCommands = [
+    'agent sandbox run -- touch .cursor-runtime/sandbox-check',
+    'agent sandbox run -- touch .cursor-runtime/sandbox-smoke',
+    'agent sandbox run -- touch .cursor-runtime/followup-sandbox-check',
+    'agent sandbox run -- touch .cursor-runtime/implement-sandbox-check',
+    'agent sandbox run -- touch .cursor-runtime/fix-sandbox-check',
+  ];
+  const expectedCurlCommand =
+    'if agent sandbox run -- curl -fsS --max-time 3 -o /dev/null https://example.com; then';
+
+  assert.equal(sandboxRunLines.length, 10);
+  assert.deepEqual(
+    sandboxRunLines.filter((line) => line.includes(' -- touch ')).sort(),
+    expectedTouchCommands.sort(),
+  );
+  assert.equal(
+    sandboxRunLines.filter((line) => line === expectedCurlCommand).length,
+    5,
+  );
 });
 
 test('normalizeExternalResearchText accepts sourced research and explicit no-op', () => {
@@ -1955,9 +2092,12 @@ test('workflow confines forced WebSearch to isolated read-only research passes',
   assert.equal(researchRuns.length, 2);
   for (const run of researchRuns) {
     assert.match(run, /mktemp -d \/tmp\/cursor-web-research/);
-    assert.match(run, /agent -p --mode=ask --force --trust --sandbox enabled/);
+    assert.doesNotMatch(run, /CURSOR_API_KEY|CURSOR_AUTH_TOKEN/);
+    assert.match(
+      run,
+      /"\$RUNNER_TEMP\/cursor-agent-authenticated" \\\n\s+-p --mode=ask --force --trust --sandbox enabled/,
+    );
     assert.match(run, /--output-format stream-json/);
-    assert.match(run, /env -u CURSOR_API_KEY -u CURSOR_AUTH_TOKEN/);
     assert.match(run, /GITHUB_TOKEN: ''/);
     assert.match(run, /GH_TOKEN: ''/);
     assert.match(run, /Shell\(\*\)/);
@@ -1966,22 +2106,72 @@ test('workflow confines forced WebSearch to isolated read-only research passes',
     assert.match(run, /process\.env\.HOME/);
     assert.match(run, /process\.env\.GITHUB_WORKSPACE/);
     // Research itself must not write the non-research web-tool denylist.
-    assert.doesNotMatch(run, /"WebSearch\(\*\)"/);
-    assert.doesNotMatch(run, /"WebFetch\(\*\)"/);
+    assert.doesNotMatch(run, /denyWeb: true/);
   }
 
   const nonResearchAgentLines = workflow
     .split('\n')
-    .filter((line) => line.includes('agent -p') && !line.includes('--force'));
+    .filter((line) => line.includes('-p ') && line.includes('--trust') && !line.includes('--force'));
   assert.ok(nonResearchAgentLines.length >= 4);
   assert.equal(
-    workflow.split('\n').filter((line) => line.includes('agent -p') && line.includes('--force')).length,
+    workflow.split('\n').filter((line) => (
+      line.includes('-p ') && line.includes('--trust') && line.includes('--force')
+    )).length,
     2,
   );
-  assert.equal((workflow.match(/"WebSearch\(\*\)"/g) || []).length, 4);
-  assert.equal((workflow.match(/"WebFetch\(\*\)"/g) || []).length, 4);
+  assert.equal((workflow.match(/denyWeb: true/g) || []).length, 5);
   assert.doesNotMatch(workflow, /issue-research-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/);
   assert.match(workflow, /name: issue-research-\$\{\{ github\.run_id \}\}[\s\S]*?overwrite: true/);
+});
+
+test('every Cursor agent invocation uses the one-shot credential descriptor bridge', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', '.github', 'workflows', 'cursor-automation.yml'),
+    'utf8',
+  );
+  const agentCalls = workflow
+    .split('\n')
+    .filter((line) => (
+      line.includes('"$RUNNER_TEMP/cursor-agent-authenticated"') && line.trimEnd().endsWith('\\')
+    ));
+
+  assert.equal(agentCalls.length, 8);
+  assert.doesNotMatch(workflow, /env -u CURSOR_API_KEY -u CURSOR_AUTH_TOKEN/);
+  assert.doesNotMatch(workflow, /agent --api-key/);
+  assert.doesNotMatch(workflow, /cursor_api_key="\$CURSOR_API_KEY"/);
+  assert.doesNotMatch(workflow, /3<<<"\$cursor_api_key"/);
+  assert.equal((workflow.match(/prepare_cursor_credential_bridge/g) || []).length, 5);
+  assert.equal((workflow.match(/run: &stage_cursor_api_key \|/g) || []).length, 1);
+  assert.equal((workflow.match(/run: \*stage_cursor_api_key/g) || []).length, 6);
+  assert.equal((workflow.match(/- name: Stage Cursor API key/g) || []).length, 7);
+  const keyedRunSteps = [...workflow.matchAll(
+    /      - name: (?:Research external context for classification|Classify with Cursor CLI|Run authenticated Cursor agent smoke|Research external context for follow-up|Review follow-up with Cursor CLI|Implement with Cursor CLI|Fix with Cursor CLI)\n[\s\S]*?(?=\n      - name:|\n  [a-zA-Z0-9_]+:)/g,
+  )].map((match) => match[0]);
+  assert.equal(keyedRunSteps.length, 7);
+  for (const step of keyedRunSteps) {
+    assert.doesNotMatch(step, /CURSOR_API_KEY|CURSOR_AUTH_TOKEN/);
+    assert.match(step, /"\$RUNNER_TEMP\/cursor-agent-authenticated"/);
+    assert.match(step, /sudo --preserve-env=HOME,RUNNER_TEMP,GITHUB_WORKSPACE/);
+  }
+  assert.match(workflow, /AGENT_CLI_CREDENTIAL_STORE=memory/);
+  assert.match(workflow, /CURSOR_INVOKED_AS=agent/);
+  assert.match(workflow, /CURSOR_TOOL_PATH="\$runner_node_dir:/);
+  assert.match(workflow, /export PATH=\$\{JSON\.stringify\(toolPath\)\}/);
+  assert.match(workflow, /"\$RUNNER_TOOL_CACHE"\/node\/\*\/bin/);
+  assert.match(workflow, /official install directory/);
+  assert.match(workflow, /CURSOR_API_KEY_FD=3/);
+  assert.match(workflow, /process\.argv\.splice\(2, 0, '--api-key', value\)/);
+  assert.match(workflow, /delete process\.env\.CURSOR_API_KEY/);
+  assert.match(workflow, /delete process\.env\.CURSOR_AUTH_TOKEN/);
+  assert.match(workflow, /delete process\.env\.NODE_OPTIONS/);
+  assert.match(workflow, /secret\.fill\(0\)/);
+  assert.match(workflow, /sudo install -o root -g root -m 0400/);
+  assert.match(workflow, /exec 3<"\$key_file"/);
+  assert.match(workflow, /rm -f "\$key_file"/);
+  assert.match(workflow, /XDG_CONFIG_HOME="\$auth_config"/);
+  assert.match(workflow, /\/usr\/bin\/setpriv --reuid/);
+  assert.match(workflow, /"\$CURSOR_AGENT_DIR\/node" --use-system-ca/);
+  assert.match(workflow, /sudo chown root:root/);
 });
 
 test('workflow denies WebSearch only after isolated research, not before it', () => {
@@ -2008,21 +2198,15 @@ test('workflow denies WebSearch only after isolated research, not before it', ()
     const preResearch = job.slice(0, researchIdx);
     assert.doesNotMatch(
       preResearch,
-      /"WebSearch\(\*\)"/,
+      /denyWeb: true/,
       `${label} must not deny WebSearch before research`,
-    );
-    assert.doesNotMatch(
-      preResearch,
-      /"WebFetch\(\*\)"/,
-      `${label} must not deny WebFetch before research`,
     );
 
     const postResearch = job.slice(researchIdx);
     const denyStep = postResearch.match(
       /- name: Deny WebSearch and WebFetch after[\s\S]*?(?=\n\s{6}- name:)/,
     )?.[0] || '';
-    assert.match(denyStep, /"WebSearch\(\*\)"/, `${label} post-research deny missing WebSearch`);
-    assert.match(denyStep, /"WebFetch\(\*\)"/, `${label} post-research deny missing WebFetch`);
+    assert.match(denyStep, /denyWeb: true/, `${label} post-research deny missing web block`);
 
     const denyIdx = postResearch.indexOf('- name: Deny WebSearch and WebFetch after');
     const agentIdx = postResearch.search(
@@ -2035,7 +2219,7 @@ test('workflow denies WebSearch only after isolated research, not before it', ()
   const implementJob = workflow.match(
     /\n  implement:\n[\s\S]*?(?=\n  [a-zA-Z0-9_]+:\n)/,
   )?.[0] || '';
-  assert.match(implementJob, /Require the Cursor command sandbox for implementation[\s\S]*?"WebSearch\(\*\)"/);
+  assert.match(implementJob, /Require the Cursor command sandbox for implementation[\s\S]*?denyWeb: true/);
   assert.doesNotMatch(implementJob, /Research external context/);
 });
 
