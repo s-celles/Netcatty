@@ -217,6 +217,7 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
     cursor: string;
     codebuddy: string;
     opencode: string;
+    antigravity: string;
   } | null>(null);
   if (!initialManagedPathsRef.current) {
     initialManagedPathsRef.current = getInitialManagedAgentPaths(externalAgents);
@@ -282,6 +283,13 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
   const [opencodeCustomPath, setOpencodeCustomPath] = useState(() => initialManagedPathsRef.current?.opencode ?? "");
   const [isResolvingOpencode, setIsResolvingOpencode] = useState(false);
 
+  const [antigravityPathInfo, setAntigravityPathInfo] = useState<AgentPathInfo | null>(
+    () => getSavedManagedAgentPathInfo(externalAgents, "antigravity"),
+  );
+  const [antigravityCustomPath, setAntigravityCustomPath] = useState(() => initialManagedPathsRef.current?.antigravity ?? "");
+  const [isResolvingAntigravity, setIsResolvingAntigravity] = useState(false);
+  const [isDownloadingAntigravity, setIsDownloadingAntigravity] = useState(false);
+
   const codebuddyManagedEnv = useMemo(
     () => externalAgents.find((a) => a.id === "discovered_codebuddy")?.env,
     [externalAgents],
@@ -341,7 +349,9 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
             ? setCursorPathInfo
             : agentKey === "codebuddy"
               ? setCodebuddyPathInfo
-              : setOpencodePathInfo;
+              : agentKey === "opencode"
+                ? setOpencodePathInfo
+                : setAntigravityPathInfo;
 
     setInfo(result);
 
@@ -382,7 +392,9 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
             ? setIsResolvingCursor
             : agentKey === "codebuddy"
               ? setIsResolvingCodebuddy
-              : setIsResolvingOpencode;
+              : agentKey === "opencode"
+                ? setIsResolvingOpencode
+                : setIsResolvingAntigravity;
 
     setResolving(true);
     const requestId = (agentPathRequestIdRef.current[agentKey] ?? 0) + 1;
@@ -421,7 +433,9 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
                 ? setCursorPathInfo
                 : agentKey === "codebuddy"
                   ? setCodebuddyPathInfo
-                  : setOpencodePathInfo;
+                  : agentKey === "opencode"
+                    ? setOpencodePathInfo
+                    : setAntigravityPathInfo;
         setInfo(result);
         return result;
       }
@@ -681,6 +695,29 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
   }, [setExternalAgents]);
 
   // Validate a custom path for an agent.
+  const handleDownloadAntigravity = useCallback(async () => {
+    try {
+      setIsDownloadingAntigravity(true);
+      const bridge = getBridge() as { aiAntigravityInstallHarness?: () => Promise<{ ok: boolean; path: string; error?: string }> };
+      if (!bridge?.aiAntigravityInstallHarness) {
+        throw new Error("Antigravity installer not available");
+      }
+      const res = await bridge.aiAntigravityInstallHarness();
+      if (!res.ok) throw new Error(res.error || "Installation failed");
+      
+      setAntigravityCustomPath(res.path);
+      await resolveAgentPath("antigravity", res.path, {
+        refreshShellEnv: true,
+        commandSource: "manual",
+      });
+    } catch (err: unknown) {
+      console.error("Failed to download antigravity", err);
+      window.alert("Failed to download Antigravity: " + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setIsDownloadingAntigravity(false);
+    }
+  }, [resolveAgentPath]);
+
   const handleCheckCustomPath = useCallback(async (agentKey: ManagedAgentKey) => {
     const customPath = agentKey === "codex"
       ? codexCustomPath
@@ -692,7 +729,9 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
             ? codebuddyCustomPath
             : agentKey === "opencode"
               ? opencodeCustomPath
-              : "";
+              : agentKey === "antigravity"
+                ? antigravityCustomPath
+                : "";
     const result = await resolveAgentPath(agentKey, customPath, {
       refreshShellEnv: true,
       commandSource: customPath.trim() ? "manual" : "auto",
@@ -704,7 +743,7 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
         codexPath: result?.path || customPath.trim() || undefined,
       });
     }
-  }, [claudeCustomPath, codexCustomPath, copilotCustomPath, codebuddyCustomPath, opencodeCustomPath, resolveAgentPath, refreshCodexIntegration]);
+  }, [claudeCustomPath, codexCustomPath, copilotCustomPath, codebuddyCustomPath, opencodeCustomPath, antigravityCustomPath, resolveAgentPath, refreshCodexIntegration]);
 
   const handleResetCustomPath = useCallback(async (agentKey: ManagedAgentKey) => {
     if (agentKey === "codex") {
@@ -717,6 +756,8 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
       setCodebuddyCustomPath("");
     } else if (agentKey === "opencode") {
       setOpencodeCustomPath("");
+    } else if (agentKey === "antigravity") {
+      setAntigravityCustomPath("");
     }
 
     const result = await resolveAgentPath(agentKey, "", {
@@ -1104,6 +1145,23 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
               onRecheckPath={() => void handleCheckCustomPath("opencode")}
               onResetPath={() => void handleResetCustomPath("opencode")}
               i18nPrefix="ai.opencode"
+            />
+          </SettingsSection>
+
+          <SettingsSection
+            title="Antigravity"
+            leading={<AgentIconBadge agent={{ id: "antigravity", icon: "antigravity", name: "Antigravity" }} variant="plain" className="h-5 w-5 text-muted-foreground/90" />}
+          >
+            <CopilotCliCard
+              pathInfo={antigravityPathInfo}
+              isResolvingPath={isResolvingAntigravity}
+              customPath={antigravityCustomPath}
+              onCustomPathChange={setAntigravityCustomPath}
+              onRecheckPath={() => void handleCheckCustomPath("antigravity")}
+              onResetPath={() => void handleResetCustomPath("antigravity")}
+              onDownload={handleDownloadAntigravity}
+              isDownloading={isDownloadingAntigravity}
+              i18nPrefix="ai.antigravity"
             />
           </SettingsSection>
 

@@ -76,6 +76,13 @@ export interface ExternalTurnContext {
   toolIntegrationMode: AIToolIntegrationMode;
   selectedUserSkillSlugs?: string[];
   permissionMode: AIPermissionMode;
+  
+  // Fields shared with CattyTurnContext (required by antigravity localharness)
+  getExecutorContext?: () => ExecutorContext;
+  scopeType?: 'terminal' | 'workspace';
+  scopeTargetId?: string;
+  scopeLabel?: string;
+  webSearchConfig?: WebSearchConfig | null;
 }
 
 export interface CattyTurnInput {
@@ -106,7 +113,20 @@ export interface ExternalTurnInput {
   ui: TurnUiCallbacks;
 }
 
-export type TurnInput = CattyTurnInput | ExternalTurnInput;
+export interface AntigravityTurnInput {
+  backend: 'antigravity';
+  chatSessionId: string;
+  assistantMsgId: string;
+  userText: string;
+  signal: AbortSignal;
+  agentConfig: ExternalAgentConfig;
+  context: CattyTurnContext;
+  attachments?: ChatMessageAttachment[];
+  bridge?: unknown;
+  ui: TurnUiCallbacks;
+}
+
+export type TurnInput = CattyTurnInput | ExternalTurnInput | AntigravityTurnInput;
 
 export interface TurnResult {
   turnId: string;
