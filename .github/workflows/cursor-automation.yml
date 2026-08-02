@@ -1007,12 +1007,27 @@ jobs:
             exit 1
           fi
 
+      - name: Check Cursor API key
+        id: check_api_key
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$CURSOR_API_KEY" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::CURSOR_API_KEY is not configured; skipping authenticated smoke steps."
+          fi
+
       - name: Stage Cursor API key for authenticated smoke
+        if: steps.check_api_key.outputs.configured == 'true'
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: *stage_cursor_api_key
 
       - name: Prepare Cursor credential leak probe
+        if: steps.check_api_key.outputs.configured == 'true'
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
@@ -1088,6 +1103,7 @@ jobs:
           sudo chmod 0444 "$RUNNER_TEMP/cursor-auth-probe.cjs"
 
       - name: Run authenticated Cursor agent smoke
+        if: steps.check_api_key.outputs.configured == 'true'
         env:
           GITHUB_TOKEN: ''
           GH_TOKEN: ''
@@ -1130,6 +1146,7 @@ jobs:
           ! compgen -G "$RUNNER_TEMP/cursor-auth-config.*/cursor/auth.json" >/dev/null
 
       - name: Scan authenticated Cursor smoke output for credential leaks
+        if: steps.check_api_key.outputs.configured == 'true'
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
