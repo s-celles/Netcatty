@@ -16,13 +16,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          # Same PAT used for releases — needs stargazers read (admin/collaborator)
-          # plus contents write to push SVG updates.
-          token: ${{ secrets.RELEASE_TOKEN }}
+          # RELEASE_TOKEN is the PAT the release workflow uses. It is optional
+          # here: the stargazer list of a public repository is readable with the
+          # job's own GITHUB_TOKEN, and `permissions: contents: write` above is
+          # enough to push the regenerated SVGs. Without the fallback the whole
+          # job died on `Input required and not supplied: token` whenever the
+          # secret was absent, which it has been since the workflow was added.
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Generate star history SVGs
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           tmpdir=$(mktemp -d)
